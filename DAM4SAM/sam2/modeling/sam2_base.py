@@ -9,6 +9,7 @@ import torch.distributed
 import torch.nn.functional as F
 from torch.nn.init import trunc_normal_
 
+from sam2.modeling.backbones.image_encoder import ImageEncoder
 from sam2.modeling.sam.mask_decoder import MaskDecoder
 from sam2.modeling.sam.prompt_encoder import PromptEncoder
 from sam2.modeling.sam.transformer import TwoWayTransformer
@@ -21,7 +22,7 @@ NO_OBJ_SCORE = -1024.0
 class SAM2Base(torch.nn.Module):
     def __init__(
         self,
-        image_encoder,
+        image_encoder: ImageEncoder,
         memory_attention,
         memory_encoder,
         num_maskmem=7,  # default 1 input frame + 6 previous frames
@@ -372,7 +373,7 @@ class SAM2Base(torch.nn.Module):
         sam_output_token = sam_output_tokens[:, 0]
         all_low_res_masks = low_res_multimasks.squeeze().cpu().detach().numpy().copy()
         all_ious = ious.squeeze().float().cpu().detach().numpy().copy()
-    
+
         if multimask_output:
             # Multimask output is used for analyzing the alternative masks to search for potential distractors,
             # Leading to adding the frames to DRM part of the memory.
@@ -381,18 +382,24 @@ class SAM2Base(torch.nn.Module):
             best_iou_inds = torch.argmax(ious, dim=-1)
             batch_inds = torch.arange(B, device=device)
             low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-            low_res_multimasks[batch_inds, best_iou_inds] = low_res_masks.squeeze().unsqueeze(0).clone()
-            all_low_res_masks = low_res_multimasks.squeeze().cpu().detach().numpy().copy()
+            low_res_multimasks[batch_inds, best_iou_inds] = (
+                low_res_masks.squeeze().unsqueeze(0).clone()
+            )
+            all_low_res_masks = (
+                low_res_multimasks.squeeze().cpu().detach().numpy().copy()
+            )
 
             high_res_multimasks = F.interpolate(
                 low_res_multimasks,
                 size=(self.image_size, self.image_size),
                 mode="bilinear",
                 align_corners=False,
-            )            
-            high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)            
-            high_res_multimasks[batch_inds, best_iou_inds] = high_res_masks.squeeze().unsqueeze(0).clone()
-            
+            )
+            high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
+            high_res_multimasks[batch_inds, best_iou_inds] = (
+                high_res_masks.squeeze().unsqueeze(0).clone()
+            )
+
             if sam_output_tokens.size(1) > 1:
                 sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
         else:
@@ -401,7 +408,7 @@ class SAM2Base(torch.nn.Module):
                 size=(self.image_size, self.image_size),
                 mode="bilinear",
                 align_corners=False,
-            )      
+            )
             low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
 
         # Extract object pointer from the SAM output token (with occlusion handling)
@@ -482,9 +489,14 @@ class SAM2Base(torch.nn.Module):
             object_score_logits,
         )
 
+    ## image_encoder && self.sam_mask_decoder.conv_s0 && sam_mask_decoder.conv_s1
     def forward_image(self, img_batch: torch.Tensor):
         """Get the image feature on the input batch."""
         backbone_out = self.image_encoder(img_batch)
+        print(
+            f"===>image_encoder {type(self.image_encoder)}, {type(self.image_encoder.trunk)}, {type(self.image_encoder.neck)}, {self.image_encoder.scalp}"
+        )
+
         if self.use_high_res_features_in_sam:
             # precompute projected level 0 and level 1 features in SAM decoder
             # to avoid running it again on every SAM click
@@ -495,6 +507,28 @@ class SAM2Base(torch.nn.Module):
                 backbone_out["backbone_fpn"][1]
             )
         return backbone_out
+
+    def forward_image_inference(self, img_batch: torch.Tensor):
+        """Get the image feature on the input batch."""
+        backbone_out = self.image_encoder(img_batch)
+        print(
+            f"===>image_encoder {type(self.image_encoder)}, {type(self.image_encoder.trunk)}, {type(self.image_encoder.neck)}, {self.image_encoder.scalp}"
+        )
+
+        if self.use_high_res_features_in_sam:
+            # precompute projected level 0 and level 1 features in SAM decoder
+            # to avoid running it again on every SAM click
+            backbone_out["backbone_fpn"][0] = self.sam_mask_decoder.conv_s0(
+                backbone_out["backbone_fpn"][0]
+            )
+            backbone_out["backbone_fpn"][1] = self.sam_mask_decoder.conv_s1(
+                backbone_out["backbone_fpn"][1]
+            )
+        return (
+            backbone_out["vision_features"],
+            *backbone_out["backbone_fpn"],
+            *backbone_out["vision_pos_enc"],
+        )
 
     def _prepare_backbone_features(self, backbone_out):
         """Prepare and flatten visual features."""
@@ -546,51 +580,77 @@ class SAM2Base(torch.nn.Module):
             cond_outputs = output_dict["cond_frame_outputs"]
             selected_cond_outputs, unselected_cond_outputs = select_closest_cond_frames(
                 frame_idx, cond_outputs, self.max_cond_frames_in_attn
-            ) # These are the selected frames from the DRM part of the memory
+            )  # These are the selected frames from the DRM part of the memory
             # There is no temporal positional encoding for the DRM part of the memory
-            t_pos_and_prevs = [(0, out) for out in selected_cond_outputs.values()] 
+            t_pos_and_prevs = [(0, out) for out in selected_cond_outputs.values()]
 
             # Add last (self.num_maskmem - 1) frames before current frame for non-conditioning memory
             # the earliest one has t_pos=1 and the latest one has t_pos=self.num_maskmem-1
             # We also allow taking the memory frame non-consecutively (with r>1), in which case
             # we take (self.num_maskmem - 2) frames among every r-th frames plus the last frame.
             r = self.memory_temporal_stride_for_eval
-                    
+
             outs_ = []
             ram_frame_indices = []
             # In RAM part of memory, don't include the frames where the target is not visible
-            for i in range(self.num_maskmem - 1 - (len(t_pos_and_prevs)-1)):
+            for i in range(self.num_maskmem - 1 - (len(t_pos_and_prevs) - 1)):
                 if i == 0:
-                    prev_frame_idx = frame_idx - 1    
+                    prev_frame_idx = frame_idx - 1
                     if frame_idx - 1 in output_dict["cond_frame_outputs"]:
-                        out = output_dict["cond_frame_outputs"].get(prev_frame_idx, None)
+                        out = output_dict["cond_frame_outputs"].get(
+                            prev_frame_idx, None
+                        )
                     else:
-                        out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
+                        out = output_dict["non_cond_frame_outputs"].get(
+                            prev_frame_idx, None
+                        )
 
-                    if out is None or out['n_pixels_pos'] < 1 or prev_frame_idx in selected_cond_outputs:
+                    if (
+                        out is None
+                        or out["n_pixels_pos"] < 1
+                        or prev_frame_idx in selected_cond_outputs
+                    ):
                         # on this memory frame target is considered as absent
                         # thus we need to find older frame where target was visible
                         while True:
                             prev_frame_idx -= 1
                             if prev_frame_idx > 0:
-                                out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
-                                if out is not None and out['n_pixels_pos'] >= 1 and prev_frame_idx not in selected_cond_outputs:
+                                out = output_dict["non_cond_frame_outputs"].get(
+                                    prev_frame_idx, None
+                                )
+                                if (
+                                    out is not None
+                                    and out["n_pixels_pos"] >= 1
+                                    and prev_frame_idx not in selected_cond_outputs
+                                ):
                                     break
                             else:
                                 out = None
                                 break
                 elif prev_frame_idx >= 0:
                     prev_frame_idx = ((prev_frame_idx - 1) // r) * r
-                    out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
-                    if out is None or out['n_pixels_pos'] < 1 or prev_frame_idx in selected_cond_outputs:
+                    out = output_dict["non_cond_frame_outputs"].get(
+                        prev_frame_idx, None
+                    )
+                    if (
+                        out is None
+                        or out["n_pixels_pos"] < 1
+                        or prev_frame_idx in selected_cond_outputs
+                    ):
 
                         # on this memory frame target is considered as absent
                         # thus we need to find older frame where target was visible
                         while True:
                             prev_frame_idx -= r
                             if prev_frame_idx > 0:
-                                out = output_dict["non_cond_frame_outputs"].get(prev_frame_idx, None)
-                                if out is not None and out['n_pixels_pos'] >= 1 and prev_frame_idx not in selected_cond_outputs:
+                                out = output_dict["non_cond_frame_outputs"].get(
+                                    prev_frame_idx, None
+                                )
+                                if (
+                                    out is not None
+                                    and out["n_pixels_pos"] >= 1
+                                    and prev_frame_idx not in selected_cond_outputs
+                                ):
                                     break
                             else:
                                 out = None
@@ -609,10 +669,15 @@ class SAM2Base(torch.nn.Module):
             # All DRM frames have t_pos=0, and all RAM frames have t_pos>0
             t_pos_and_prevs = sorted(t_pos_and_prevs, key=lambda x: x[0])
 
-            outs_ = [x[1] for x in t_pos_and_prevs] # Sorted from oldest to newest frame, all DRM frames first, then RAM frames
+            outs_ = [
+                x[1] for x in t_pos_and_prevs
+            ]  # Sorted from oldest to newest frame, all DRM frames first, then RAM frames
 
             # Construct the list with corresponding indices for temporal positional encoding
-            t_pos_and_prevs = [(0, prev) if t_pos == 0 else (t_pos_idx, prev) for t_pos_idx, (t_pos, prev) in enumerate(t_pos_and_prevs)]
+            t_pos_and_prevs = [
+                (0, prev) if t_pos == 0 else (t_pos_idx, prev)
+                for t_pos_idx, (t_pos, prev) in enumerate(t_pos_and_prevs)
+            ]
 
             total_num_maskmem = len(t_pos_and_prevs)
             for t_pos, prev in t_pos_and_prevs:
@@ -633,7 +698,11 @@ class SAM2Base(torch.nn.Module):
 
             # Construct the list of past object pointers
             if self.use_obj_ptrs_in_encoder:
-                max_obj_ptrs_in_encoder = min(num_frames, self.max_obj_ptrs_in_encoder) if num_frames is not None else self.max_obj_ptrs_in_encoder
+                max_obj_ptrs_in_encoder = (
+                    min(num_frames, self.max_obj_ptrs_in_encoder)
+                    if num_frames is not None
+                    else self.max_obj_ptrs_in_encoder
+                )
                 # First add those object pointers from selected conditioning frames
                 # (optionally, only include object pointers in the past during evaluation)
                 if not self.training and self.only_obj_ptrs_in_the_past_for_eval:
@@ -644,7 +713,7 @@ class SAM2Base(torch.nn.Module):
                     }
                 else:
                     ptr_cond_outputs = selected_cond_outputs
-                                    
+
                 pos_and_ptrs = [
                     # Temporal pos encoding contains how far away each pointer is from current frame
                     (abs(frame_idx - t), out["obj_ptr"])
@@ -658,7 +727,9 @@ class SAM2Base(torch.nn.Module):
                     out = output_dict["non_cond_frame_outputs"].get(
                         t, unselected_cond_outputs.get(t, None)
                     )
-                    if out is not None and out['n_pixels_pos'] >= 1:  # use only when object visible
+                    if (
+                        out is not None and out["n_pixels_pos"] >= 1
+                    ):  # use only when object visible
                         pos_and_ptrs.append((t_diff, out["obj_ptr"]))
 
                 # If we have at least one object pointer, add them to the across attention
@@ -745,7 +816,7 @@ class SAM2Base(torch.nn.Module):
         else:
             # apply sigmoid on the raw mask logits to turn them into range (0, 1)
             mask_for_mem = torch.sigmoid(pred_masks_high_res)
-        
+
         # apply scale and bias terms to the sigmoid probabilities
         if self.sigmoid_scale_for_mem_enc != 1.0:
             mask_for_mem = mask_for_mem * self.sigmoid_scale_for_mem_enc
@@ -888,7 +959,7 @@ class SAM2Base(torch.nn.Module):
             num_frames,
             track_in_reverse,
             prev_sam_mask_logits,
-        )   
+        )
 
         if len(sam_outputs) == 8:
             (
@@ -902,21 +973,17 @@ class SAM2Base(torch.nn.Module):
                 all_low_res_masks,
             ) = sam_outputs
         else:
-            (
-                _,
-                _,
-                _,
-                low_res_masks,
-                high_res_masks,
-                obj_ptr,
-                object_score_logits
-            ) = sam_outputs
+            (_, _, _, low_res_masks, high_res_masks, obj_ptr, object_score_logits) = (
+                sam_outputs
+            )
             all_low_res_masks = None
 
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
         current_out["obj_ptr"] = obj_ptr
-        current_out["all_pred_masks"] = all_low_res_masks # Alternative masks for distractor analysis
+        current_out["all_pred_masks"] = (
+            all_low_res_masks  # Alternative masks for distractor analysis
+        )
 
         if not self.training:
             # Only add this in inference (to avoid unused param in activation checkpointing;

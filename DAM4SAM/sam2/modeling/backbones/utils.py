@@ -27,8 +27,9 @@ def window_partition(x, window_size):
 
     pad_h = (window_size - H % window_size) % window_size
     pad_w = (window_size - W % window_size) % window_size
-    if pad_h > 0 or pad_w > 0:
-        x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))
+    # print(pad_h, pad_w, window_size, H, W)
+    # if pad_h > 0 or pad_w > 0:
+    x = F.pad(x, (0, 0, 0, pad_w, 0, pad_h))    # it is ok for pad_w or pad_h is 0
     Hp, Wp = H + pad_h, W + pad_w
 
     x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
@@ -57,8 +58,8 @@ def window_unpartition(windows, window_size, pad_hw, hw):
     )
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, -1)
 
-    if Hp > H or Wp > W:
-        x = x[:, :H, :W, :].contiguous()
+    # if Hp > H or Wp > W:
+    x = x[:, :H, :W, :].contiguous()
     return x
 
 

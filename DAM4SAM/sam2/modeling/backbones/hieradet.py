@@ -288,14 +288,17 @@ class Hiera(nn.Module):
         x = x + self._get_pos_embed(x.shape[1:3])
 
         outputs = []
+        return_index = []
         for i, blk in enumerate(self.blocks):
             x = blk(x)
             if (i == self.stage_ends[-1]) or (
                 i in self.stage_ends and self.return_interm_layers
             ):
+                return_index.append(i)
                 feats = x.permute(0, 3, 1, 2)
                 outputs.append(feats)
 
+        print(f"=> return {return_index}, len_block={self.stage_ends}, {self.return_interm_layers}")
         return outputs
 
     def get_layer_id(self, layer_name):

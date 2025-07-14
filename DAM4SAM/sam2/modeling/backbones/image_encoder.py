@@ -9,6 +9,8 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import sam2
+from sam2.modeling.backbones.hieradet import Hiera
 
 
 class ImageEncoder(nn.Module):
@@ -19,19 +21,26 @@ class ImageEncoder(nn.Module):
         scalp: int = 0,
     ):
         super().__init__()
-        self.trunk = trunk
-        self.neck = neck
+        self.trunk = trunk  # type: Hiera
+        self.neck = neck  # type: FpnNeck
         self.scalp = scalp
         assert (
             self.trunk.channel_list == self.neck.backbone_channel_list
         ), f"Channel dims of trunk and neck do not match. Trunk: {self.trunk.channel_list}, neck: {self.neck.backbone_channel_list}"
 
     def forward(self, sample: torch.Tensor):
+        print(f"=>ImageEncoder input {sample.shape}, {sample.dtype}")
         # Forward through backbone
         features, pos = self.neck(self.trunk(sample))
         if self.scalp > 0:
             # Discard the lowest resolution features
             features, pos = features[: -self.scalp], pos[: -self.scalp]
+
+        for feature in features:
+            print(f"feature: {feature.shape}")
+        
+        for p in pos:
+            print(f"pos: {p.shape}")
 
         src = features[-1]
         output = {
@@ -40,6 +49,21 @@ class ImageEncoder(nn.Module):
             "backbone_fpn": features,
         }
         return output
+    
+    def inference(self, sample: torch.Tensor):
+        # Forward through backbone
+        features, pos = self.neck(self.trunk(sample))
+        if self.scalp > 0:
+            # Discard the lowest resolution features
+            features, pos = features[: -self.scalp], pos[: -self.scalp]
+
+        # src = features[-1]
+        # output = {
+        #     "vision_features": src,
+        #     "vision_pos_enc": pos,
+        #     "backbone_fpn": features,
+        # }
+        return *features, *pos
 
 
 class FpnNeck(nn.Module):
@@ -100,7 +124,8 @@ class FpnNeck(nn.Module):
         self.fpn_top_down_levels = list(fpn_top_down_levels)
 
     def forward(self, xs: List[torch.Tensor]):
-
+        for _x in xs:
+            print(f"=>>FpnNeck input {_x.shape}, {_x.dtype}")
         out = [None] * len(self.convs)
         pos = [None] * len(self.convs)
         assert len(xs) == len(self.convs)

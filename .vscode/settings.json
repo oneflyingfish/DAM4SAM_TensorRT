@@ -1,0 +1,6 @@
+{
+    "remoteX11.SSH.privateKey": "",
+    "python.analysis.extraPaths": [
+        "DAM4SAM"
+    ]
+}

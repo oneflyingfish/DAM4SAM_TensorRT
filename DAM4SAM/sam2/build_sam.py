@@ -7,6 +7,7 @@
 import logging
 import os
 
+import sam2.sam2_video_predictor
 import torch
 from hydra import compose
 from hydra.utils import instantiate
@@ -105,7 +106,7 @@ def build_sam2_video_predictor(
     hydra_overrides_extra=[],
     apply_postprocessing=True,
     **kwargs,
-):
+) -> sam2.sam2_video_predictor.SAM2VideoPredictor:
     hydra_overrides = [
         "++model._target_=sam2.sam2_video_predictor.SAM2VideoPredictor",
     ]

@@ -11,7 +11,7 @@ from collections import OrderedDict
 import random
 import os
 from utils.utils import keep_largest_component, determine_tracker
-
+from sam2.sam2_video_predictor import SAM2VideoPredictor
 from pathlib import Path
 config_path = Path(__file__).parent / "dam4sam_config.yaml"
 with open(config_path) as f:
@@ -41,13 +41,14 @@ class DAM4SAMTracker():
             - "sam2pp-T": DAM4SAM (2) Hier Tiny
         """
         self.checkpoint, self.model_cfg = determine_tracker(tracker_name)
+        # checkpoints/sam2.1_hiera_large.pt, DAM4SAM/sam2/sam21pp_hiera_l.yaml
 
         # Image preprocessing parameters
         self.input_image_size = 1024       
-        self.img_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)[:, None, None]
-        self.img_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)[:, None, None]
+        self.img_mean = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32)[:, None, None]     # shape: (3,1,1)
+        self.img_std = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32)[:, None, None]      # shape: (3,1,1)
         
-        self.predictor = build_sam2_video_predictor(self.model_cfg, self.checkpoint, device="cuda:0")
+        self.predictor = build_sam2_video_predictor(self.model_cfg, self.checkpoint, device="cuda:0")   # type:SAM2VideoPredictor
         self.tracking_times = []
 
     def _prepare_image(self, img_pil):
